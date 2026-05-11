@@ -35,6 +35,11 @@ class Daemon():
 		# Controllor and queue for wpaspy binding.
 		self.wpaspy_ctrl = None
 		self.wpaspy_queue = []
+
+		# Interception hooks. Both have signature: fn(frame, iface: str) -> frame | None
+		# Return None to drop the frame. iface is 'mon' or 'eth'.
+		self.tx_hook = None  # called before every inject_mon / inject_eth
+		self.rx_hook = None  # called before every handle_mon / handle_eth dispatch
 		
 		# Configure interfaces and sockets.
 		try:
@@ -132,12 +137,20 @@ class Daemon():
 	def inject_mon(self, p):
 		if p is None or not p.haslayer(Dot11):
 			log(WARNING, "Injecting frame on monitor iface without Dot11-layer.")
+		if self.tx_hook:
+			p = self.tx_hook(p, 'mon')
+			if p is None:
+				return
 		self.sock_mon.send(p)
 
 
 	def inject_eth(self, p):
 		if p is None or not p.haslayer(Ether):
 			log(WARNING, "Injecting frame on ethernet iface witthout Ether-layer.")
+		if self.tx_hook:
+			p = self.tx_hook(p, 'eth')
+			if p is None:
+				return
 		self.sock_eth.send(p)
 
 
@@ -221,11 +234,19 @@ class Daemon():
 			
 			if self.sock_mon in sel[0]:
 				p = self.sock_mon.recv()
-				if p != None: self.handle_mon(p)
+				if p is not None:
+					if self.rx_hook:
+						p = self.rx_hook(p, 'mon')
+					if p is not None:
+						self.handle_mon(p)
 
 			if self.sock_eth in sel[0]:
 				p = self.sock_eth.recv()
-				if p != None and Ether in p: self.handle_eth(p)
+				if p is not None and Ether in p:
+					if self.rx_hook:
+						p = self.rx_hook(p, 'eth')
+					if p is not None:
+						self.handle_eth(p)
 
 			if self.wpaspy_ctrl.s in sel[0]:
 				msg = self.wpaspy_ctrl.recv()
