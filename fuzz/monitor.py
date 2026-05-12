@@ -14,6 +14,56 @@ if TYPE_CHECKING:
 
 CRASH_DIR = '/tmp'
 
+# ── PCAP writer ────────────────────────────────────────────────────────────────
+
+_PCAP_MAGIC        = 0xa1b2c3d4
+_PCAP_VERSION_MAJ  = 2
+_PCAP_VERSION_MIN  = 4
+_DLT_IEEE802_11    = 105   # raw 802.11, no RadioTap — opens directly in Wireshark
+
+
+class PcapWriter:
+    """
+    Minimal PCAP writer for raw 802.11 frames (no external dependencies).
+
+    Produces standard libpcap format (DLT=105) readable by Wireshark/tcpdump.
+    Each written frame becomes one PCAP packet with real timestamp.
+
+    Usage:
+        w = PcapWriter('/tmp/session.pcap')
+        w.write(raw_frame_bytes)
+        w.close()
+    """
+
+    def __init__(self, path: str, dlt: int = _DLT_IEEE802_11):
+        import struct as _s
+        self.path = path
+        self._f = open(path, 'wb')
+        # Global header: magic version_maj version_min thiszone sigfigs snaplen network
+        self._f.write(_s.pack('<IHHiIII',
+            _PCAP_MAGIC, _PCAP_VERSION_MAJ, _PCAP_VERSION_MIN,
+            0, 0, 65535, dlt))
+        self._f.flush()
+        self._count = 0
+
+    def write(self, data: bytes) -> None:
+        """Append one frame to the PCAP file."""
+        import struct as _s
+        ts      = time.time()
+        ts_sec  = int(ts)
+        ts_usec = int((ts - ts_sec) * 1_000_000)
+        n = len(data)
+        self._f.write(_s.pack('<IIII', ts_sec, ts_usec, n, n))
+        self._f.write(data)
+        self._f.flush()
+        self._count += 1
+
+    def close(self) -> None:
+        self._f.close()
+
+    def total(self) -> int:
+        return self._count
+
 
 @dataclass
 class FuzzEvent:
@@ -112,7 +162,7 @@ class CrashMonitor:
     """
 
     def __init__(self, station, session_id: str, check_interval: int = 30,
-                 log_dir: str = CRASH_DIR):
+                 log_dir: str = CRASH_DIR, write_pcap: bool = True):
         self.station        = station
         self.check_interval = check_interval
         self.logger         = FuzzLogger(session_id, log_dir)
@@ -121,6 +171,13 @@ class CrashMonitor:
         self._last_label    = ''
         self._last_phase    = ''
         self.state_tracker  = None  # set by FuzzCampaign after init
+
+        # PCAP capture of all injected frames (Wireshark-compatible)
+        self._pcap: Optional[PcapWriter] = None
+        if write_pcap:
+            pcap_path = os.path.join(log_dir, 'fuzz_' + session_id + '.pcap')
+            self._pcap = PcapWriter(pcap_path)
+            self.logger._write({'event': 'pcap_path', 'path': pcap_path, 'ts': time.time()})
 
     def record_inject(self, frame_bytes: bytes, phase: str, label: str) -> None:
         """
@@ -141,6 +198,8 @@ class CrashMonitor:
         event = FuzzEvent(ts=time.time(), phase=phase, label=label,
                           frame_len=len(frame_bytes))
         self.logger.log(event)
+        if self._pcap is not None:
+            self._pcap.write(frame_bytes)
 
     def log_alive_result(self, alive: bool) -> None:
         """
@@ -219,6 +278,16 @@ class CrashMonitor:
             return 'wpa_state=COMPLETED' in resp
         except Exception:
             return False
+
+    def close(self) -> None:
+        """Flush and close PCAP file."""
+        if self._pcap is not None:
+            self.logger._write({'event': 'pcap_closed',
+                                'total_frames': self._pcap.total(),
+                                'path': self._pcap.path,
+                                'ts': time.time()})
+            self._pcap.close()
+            self._pcap = None
 
     def save_crash(self) -> Optional[str]:
         """

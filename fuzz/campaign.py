@@ -180,10 +180,16 @@ class FuzzCampaign:
                                 'transitions': st.to_dict_list(),
                                 'ts': time.time()})
 
+        self.mon.close()
+
         log(STATUS, '[ap-fuzz] Campaign complete. ' +
             str(self.mon.logger.total()) + ' events logged. AP alive=' +
             str(self.mon.is_alive()))
-        log(STATUS, '[ap-fuzz] Log: ' + self.mon.logger.path)
+        log(STATUS, '[ap-fuzz] Log:  ' + self.mon.logger.path)
+        if hasattr(self.mon, '_pcap') and self.mon._pcap is None:
+            # pcap was open and just closed — reconstruct path for display
+            pcap_path = self.mon.logger.path.replace('wifi_fuzz_log_', 'fuzz_').replace('.jsonl', '.pcap')
+            log(STATUS, '[ap-fuzz] PCAP: ' + pcap_path + '  (open in Wireshark)')
 
     def _inj(self, frame, phase: str, label: str, encrypt: bool = False):
         """Encrypt (if requested) and inject frame through CrashMonitor."""

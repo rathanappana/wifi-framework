@@ -10,6 +10,7 @@ Usage:
 import sys
 import struct
 import os
+import time
 
 try:
     from scapy.layers.dot11 import (
@@ -435,12 +436,64 @@ def display_frame(path: str, data: bytes):
     print()
 
 
+# ── Raw replay (management frames only, no auth needed) ───────────────────────
+
+def raw_replay(iface: str, data: bytes, count: int = 5, delay: float = 0.5):
+    """
+    Inject raw frame via monitor socket. No authentication — works for
+    management frames (AssocReq, Auth, Deauth, Action, etc.) that don't
+    need encryption.
+
+    Data frames with Protected bit set are silently skipped.
+    """
+    if not HAS_SCAPY:
+        print('Scapy not available — cannot replay.')
+        return
+
+    # Skip encrypted data frames
+    if len(data) >= 2 and (data[1] & 0x40):
+        print('Frame has Protected bit — needs authenticated context.')
+        print('Use test-replay-crash.py via wifi-framework for encrypted frames.')
+        return
+
+    import socket
+    from scapy.layers.dot11 import Dot11
+    from scapy.arch import get_if_hwaddr
+    from scapy.sendrecv import sendp
+
+    frame = Dot11(data)
+    print(f'\n[raw-replay] Interface: {iface}  Injecting {count}× with {delay}s delay')
+    print(f'[raw-replay] Frame: {frame.summary()}')
+    print()
+
+    for i in range(1, count + 1):
+        try:
+            sendp(frame, iface=iface, verbose=False)
+            print(f'  [{i}/{count}] injected')
+        except Exception as e:
+            print(f'  [{i}/{count}] error: {e}')
+        time.sleep(delay)
+
+    print(f'[raw-replay] Done. {count} frames sent.')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) > 1:
-        paths = sys.argv[1:]
-    else:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Parse and optionally replay Wi-Fi fuzzing crash frames.')
+    parser.add_argument('files', nargs='*', help='.bin crash files to parse')
+    parser.add_argument('--replay', metavar='IFACE',
+                        help='Raw-inject frame on IFACE after parsing (mgmt frames only)')
+    parser.add_argument('--replay-count', type=int, default=5, metavar='N',
+                        help='Number of replay injections (default 5)')
+    parser.add_argument('--replay-delay', type=float, default=0.5, metavar='S',
+                        help='Seconds between replays (default 0.5)')
+    args = parser.parse_args()
+
+    paths = args.files
+    if not paths:
         p = input('Enter .bin file path: ').strip()
         paths = [p] if p else []
 
@@ -450,7 +503,6 @@ def main():
 
     for path in paths:
         if not os.path.exists(path):
-            # Try /tmp/ prefix
             alt = '/tmp/' + os.path.basename(path)
             if os.path.exists(alt):
                 path = alt
@@ -459,16 +511,18 @@ def main():
                 continue
 
         with open(path, 'rb') as f:
-            data = f.read()
+            raw_data = f.read()
 
-        # Some crash files have appended separator (from eapol_crash writer)
-        # Format: <frame_bytes>\n---\n<eapol_bytes>
-        if b'\n---\n' in data:
-            parts = data.split(b'\n---\n', 1)
+        if b'\n---\n' in raw_data:
+            parts = raw_data.split(b'\n---\n', 1)
             print(f'[Multi-part file: frame={len(parts[0])}B eapol={len(parts[1])}B]')
-            data = parts[0]
+            raw_data = parts[0]
 
-        display_frame(path, data)
+        display_frame(path, raw_data)
+
+        if args.replay:
+            raw_replay(args.replay, raw_data,
+                       count=args.replay_count, delay=args.replay_delay)
 
 
 if __name__ == '__main__':

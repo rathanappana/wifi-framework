@@ -46,7 +46,7 @@ if __name__ == "__main__":
 	parser.add_argument('--config', type=str, default=None, help="Configuration file.")
 	parser.add_argument('--binary', type=str, default=None, help="Custom hostapd/wpa_supplicant binary.")
 	parser.add_argument('--debug', type=int, default=0, help="Debug output level.")
-	options = parser.parse_args()
+	options, _ = parser.parse_known_args()  # ignore test-specific flags (e.g. --file)
 	
 	# Set debug verbosity of the logger.
 	change_log_level(-options.debug)
