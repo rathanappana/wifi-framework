@@ -34,6 +34,8 @@ from fuzz.ie_mutator import (
 from fuzz.monitor import CrashMonitor
 from fuzz.profiler import APProfile
 from fuzz.state_tracker import StateTracker, state_violation_frames
+from fuzz.feedback import FeedbackEngine, Signal
+from fuzz.response_sniffer import ResponseSniffer
 
 
 # ── Frame builders ────────────────────────────────────────────────────────────
@@ -70,7 +72,7 @@ def _enc(station, frame):
 
 class FuzzCampaign:
     """
-    Orchestrates all post-authentication fuzzing phases against a connected AP.
+    Orchestrates all post-authentication 802.11 fuzzing against a connected AP.
 
     Phases run in order. Profile-specific phases (e.g., HE Cap mutations,
     Broadcom vendor frames) are automatically included based on APProfile.
@@ -93,16 +95,35 @@ class FuzzCampaign:
         self.mon           = None
 
         if not session_id:
-            sid = hex(int(time.time()))[2:][:6]
-            session_id = sid + '_' + profile.bssid.replace(':', '')[:6]
+            from datetime import datetime as _dt
+            session_id = (_dt.now().strftime('%Y%m%d_%H%M%S') + '_'
+                          + profile.bssid.replace(':', '')[:6])
         self.mon = CrashMonitor(station, session_id=session_id,
                                 check_interval=check_interval)
         self.state_tracker = StateTracker()
         self.mon.state_tracker = self.state_tracker
 
+        # Tier 1: behavioral feedback engine (scores mutation categories)
+        # profile_id uses BSSID so scores persist per-AP across sessions
+        profile_id = profile.bssid.replace(':', '')[:12]
+        self.feedback = FeedbackEngine(profile_id=profile_id)
+        self.feedback.load()  # load prior session scores if available
+
+        # Tier 2: response sniffer (background thread, AP frame correlation)
+        self.sniffer = ResponseSniffer(
+            iface=station.nic_mon,
+            ap_bssid=profile.bssid,
+            our_mac=station.mac,
+            feedback=self.feedback,
+        )
+
     def run(self) -> None:
         """
         Run the complete post-authentication fuzzing campaign.
+
+        Starts ResponseSniffer (Tier 2) before first phase.
+        FeedbackEngine (Tier 1) scores each injection.
+        Both report at campaign end.
 
         Phase order (from most impactful to broadest):
           1. Data plane (data subtypes, TID, FCfield, QoS)
@@ -115,6 +136,8 @@ class FuzzCampaign:
         Each phase logs to the session JSONL file and saves crash frames.
         """
         log(STATUS, '[ap-fuzz] Profile: ' + str(self.profile), color='cyan')
+        self.sniffer.start()
+        log(STATUS, '[ap-fuzz] ResponseSniffer started on ' + self.station.nic_mon, color='cyan')
 
         hints = []
         if self.profile.ht_cap:  hints.append('ht_cap')
@@ -182,6 +205,15 @@ class FuzzCampaign:
 
         self.mon.close()
 
+        # Stop response sniffer + print summary
+        self.sniffer.stop()
+        log(STATUS, self.sniffer.summary(), color='cyan')
+
+        # Print + save feedback scores
+        log(STATUS, self.feedback.report(), color='cyan')
+        fb_path = self.feedback.save()
+        log(STATUS, '[ap-fuzz] Feedback saved: ' + fb_path, color='cyan')
+
         log(STATUS, '[ap-fuzz] Campaign complete. ' +
             str(self.mon.logger.total()) + ' events logged. AP alive=' +
             str(self.mon.is_alive()))
@@ -192,29 +224,52 @@ class FuzzCampaign:
             log(STATUS, '[ap-fuzz] PCAP: ' + pcap_path + '  (open in Wireshark)')
 
     def _inj(self, frame, phase: str, label: str, encrypt: bool = False):
-        """Encrypt (if requested) and inject frame through CrashMonitor."""
+        """Encrypt (if requested) and inject frame through CrashMonitor + FeedbackEngine."""
         if encrypt and self.station.tk:
             frame = _enc(self.station, frame)
         frame_bytes = raw(frame)
         self.mon.record_inject(frame_bytes, phase, label)
         self.state_tracker.set_inject_context(phase, label, self.mon._inject_count)
+        self.feedback.record_inject(phase, label)
         self.station.inject_mon(frame)
         time.sleep(self.inter_frame_s)
 
-        # Proactive: drain wpaspy queue for unsolicited DISCONNECTED events
-        # Catches disconnects between periodic alive polls.
+        # Proactive: drain wpaspy queue for DISCONNECTED events
         disconnected = self.mon.check_wpaspy_queue()
 
         ok = True
         crash_path = None
         if disconnected or self.mon.should_check():
+            t0 = time.time()
             ok = self.mon.is_alive()
+            latency_ms = (time.time() - t0) * 1000.0
             self.mon.log_alive_result(ok)
-            if not ok:
+            if ok:
+                self.feedback.record_alive(latency_ms)
+            else:
+                # Extract reason code from last wpaspy disconnect message
+                reason_code = self._last_disconnect_reason()
                 crash_path = self.mon.save_crash()
+                self.feedback.record_signal(reason_code=reason_code,
+                                             crash_saved=(crash_path is not None))
                 log(STATUS, '[ap-fuzz] Disconnect in phase=' + phase +
                     ' label=' + label + ' saved=' + str(crash_path), color='red')
         return ok, crash_path
+
+    def _last_disconnect_reason(self) -> int:
+        """Extract reason code from StateTracker's last DISCONNECTED transition."""
+        transitions = self.state_tracker.state_transitions()
+        from fuzz.state_tracker import STAState
+        for t in reversed(transitions):
+            if t.to_state == STAState.DISCONNECTED and t.trigger_msg:
+                # Parse: "CTRL-EVENT-DISCONNECTED bssid=... reason=N"
+                for token in t.trigger_msg.split():
+                    if token.startswith('reason='):
+                        try:
+                            return int(token[7:])
+                        except ValueError:
+                            pass
+        return 0
 
     def _next_seq(self) -> int:
         seq = self._seq

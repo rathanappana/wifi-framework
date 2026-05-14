@@ -7,6 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -301,14 +302,15 @@ class CrashMonitor:
         if self._last_frame is None:
             return None
         try:
-            ts    = int(time.time())
-            label = self._last_label.replace(' ', '_')[:60]
-            phase = self._last_phase
-            path  = os.path.join(CRASH_DIR, f'wifi_fuzz_crash_{ts}_{phase}_{label}.bin')
+            ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            label  = self._last_label.replace(' ', '_')[:60]
+            phase  = self._last_phase
+            path   = os.path.join(CRASH_DIR,
+                                   f'wifi_fuzz_crash_{ts_str}_{phase}_{label}.bin')
             with open(path, 'wb') as f:
                 f.write(self._last_frame)
             self.logger._write({'event': 'crash_saved', 'path': path,
-                                 'phase': phase, 'label': label, 'ts': ts})
+                                 'phase': phase, 'label': label, 'ts': time.time()})
             return path
         except Exception:
             return None
