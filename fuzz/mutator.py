@@ -66,6 +66,19 @@ class ByteStrategy(Enum):
     boundary = 'boundary'
     incr     = 'incr'
     alt      = 'alt'
+    """
+    we can add more strategies here as needed, e.g., patterns of 0x00/0xFF with random bits in between,
+    splice
+    dictionary insert
+    repeated chunks
+    length explosion
+    entropy collapse
+    bit walking
+    UTF confusion
+    integer smashing
+    compression patterns
+    alignment shifts
+    """
 
 
 def byte_mutate(length: int, strategy: ByteStrategy, seed: Optional[int] = None) -> bytes:
@@ -408,6 +421,19 @@ def ie_all_mutations(tag: int, body: bytes, seed: Optional[int] = None) -> Itera
     yield 'extended_8',     ie_extended_body(tag, body, b'\xde\xad\xbe\xef\xca\xfe\xba\xbe')
     yield 'max_claim',      ie_max_length_claim(tag, 16)
 
+"""
+def recursive_ie_mutations(ies, depth):
+
+Then randomly:
+
+mutate N IEs
+duplicate them
+shuffle order
+partially truncate stacks
+overlap lengths
+
+This explodes coverage massively.
+"""
 
 # ── Level 4: Sequence mutation (FSM-level) ────────────────────────────────────
 

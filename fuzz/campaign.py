@@ -19,7 +19,7 @@ from scapy.layers.dot11 import (
 from scapy.all import RadioTap
 
 from fuzz.mutator import (
-    ByteStrategy, byte_mutate, field_boundary_values, pack_le,
+    ByteStrategy, byte_mutate, all_byte_mutations, field_boundary_values, pack_le,
     ie_build, ie_wrong_length, ie_truncated, ie_zero_length,
     ie_max_length_claim, ie_extended_tag, ie_all_mutations,
     POST_AUTH_SEQUENCE_MUTATIONS,
@@ -177,13 +177,28 @@ class FuzzCampaign:
             if crash_path:
                 log(STATUS, '[ap-fuzz] CRASH after ' + phase_name +
                     '. Saved=' + str(crash_path), color='red')
-                # Try to reconnect and continue
+                # Try to reconnect and continue.
+                # EAP-PEAP takes 4-6s → wait up to 15s for wpa_state=COMPLETED.
+                # Do NOT use time.sleep(0.5) — that fires before auth completes.
                 try:
                     self.station.wpaspy_command('REASSOCIATE')
-                    time.sleep(0.5)
-                    if not self.mon.is_alive():
-                        log(STATUS, '[ap-fuzz] Reconnect failed. Stopping campaign.')
+                    reconnected = False
+                    for _ in range(150):     # 150 × 0.1s = 15s max
+                        time.sleep(0.1)
+                        try:
+                            st = self.station.wpaspy_command('STATUS')
+                            if 'wpa_state=COMPLETED' in st:
+                                reconnected = True
+                                break
+                        except Exception:
+                            pass
+                    if not reconnected:
+                        log(STATUS, '[ap-fuzz] Reconnect failed (15s timeout). Stopping campaign.')
+                        self.mon.logger.log_reconnect(phase_name, False)
                         break
+                    # Drain wpaspy queue — clears interim DISCONNECTED events from
+                    # the reconnect cycle so they don't get counted as new crashes.
+                    self.mon.check_wpaspy_queue()
                     log(STATUS, '[ap-fuzz] Reconnected. Continuing.', color='green')
                     self.mon.logger.log_reconnect(phase_name, True)
                 except Exception:
@@ -249,7 +264,7 @@ class FuzzCampaign:
             else:
                 # Extract reason code from last wpaspy disconnect message
                 reason_code = self._last_disconnect_reason()
-                crash_path = self.mon.save_crash()
+                crash_path = self.mon.save_crash_window()  # saves all N frames in window
                 self.feedback.record_signal(reason_code=reason_code,
                                              crash_saved=(crash_path is not None))
                 log(STATUS, '[ap-fuzz] Disconnect in phase=' + phase +
@@ -351,39 +366,55 @@ class FuzzCampaign:
             total += 1
             if cp: crash_path = cp
 
-        # QoS control field mutations (EOSP, ACK policy, AMSDU)
-        for qos_ctrl, label in [
-            (0x10, 'qos-eosp-1'),
-            (0x20, 'qos-ackpol-1'),
-            (0x40, 'qos-ackpol-2'),
-            (0x60, 'qos-ackpol-3'),
-        ]:
+        # QoS control byte [1B]: full systematic coverage
+        # field_boundary_values(1) = {0,1,85,127,128,170,254,255}
+        # all_byte_mutations(1)    = zero/one/random/xor_aa/xor_55/boundary/bit_flip/incr/alt/const
+        # QoS byte layout: TID[3:0] EOSP[4] ACK[6:5] AMSDU[7]
+        for qos_ctrl in field_boundary_values(1):
             frame = data_hdr(8, 1, 0, qos_ctrl, self._next_seq())
-            ok, cp = self._inj(frame, phase, label, encrypt=True)
+            ok, cp = self._inj(frame, phase, f'qos-ctrl-bnd-{qos_ctrl:#04x}', encrypt=True)
+            total += 1
+            if cp: crash_path = cp
+        for strategy, qos_bytes in all_byte_mutations(1):
+            frame = data_hdr(8, 1, 0, qos_bytes[0], self._next_seq())
+            ok, cp = self._inj(frame, phase, f'qos-ctrl-{strategy.value}', encrypt=True)
             total += 1
             if cp: crash_path = cp
 
-        # A-MSDU with forged inner header
-        inner_dst = b'\xff\xff\xff\xff\xff\xff'
-        inner_src = b'\xde\xad\xbe\xef\x00\x01'
-        inner_len = struct.pack('>H', 0xDEAD)
-        inner_data = b'\xde\xad\xbe\xef'
-        msdu_body = inner_dst + inner_src + inner_len + inner_data
-        frame = data_hdr(8, 1, 0, 0x80, self._next_seq())
-        ok, cp = self._inj(frame / msdu_body, phase, 'qos-amsdu-forged-sa', encrypt=True)
-        total += 1
-        if cp: crash_path = cp
+        # FCfield byte [1B]: logical combos already done above
+        # all_byte_mutations(1) adds ByteStrategy coverage beyond logical combos
+        for strategy, fc_bytes in all_byte_mutations(1):
+            fc_val = fc_bytes[0]
+            enc = bool(fc_val & 0x40)
+            frame = data_hdr(8, fc_val, 0, 0, self._next_seq())
+            ok, cp = self._inj(frame, phase, f'fc-byte-{strategy.value}', encrypt=enc)
+            total += 1
+            if cp: crash_path = cp
 
-        # A-MSDU with garbage body
-        frame = data_hdr(8, 1, 0, 0x80, self._next_seq())
-        ok, cp = self._inj(frame / (b'\xaa\xbb\xcc' * 20), phase, 'qos-amsdu-garbage', encrypt=True)
-        total += 1
-        if cp: crash_path = cp
+        # A-MSDU: forged inner header + all ByteStrategy bodies
+        inner_dst  = b'\xff\xff\xff\xff\xff\xff'
+        inner_src  = b'\xde\xad\xbe\xef\x00\x01'
+        inner_len  = struct.pack('>H', 0xDEAD)
+        msdu_fixed = inner_dst + inner_src + inner_len
+        for strategy, msdu_body in all_byte_mutations(16):
+            frame = data_hdr(8, 1, 0, 0x80, self._next_seq())
+            ok, cp = self._inj(frame / (msdu_fixed + msdu_body),
+                               phase, f'qos-amsdu-{strategy.value}', encrypt=True)
+            total += 1
+            if cp: crash_path = cp
 
-        # Duration boundary sweep
+        # Duration field [2B]: full systematic coverage
+        # field_boundary_values(2) = {0,1,85,...,65535}
+        # all_byte_mutations(2)    = each ByteStrategy on 2-byte duration field
         for dur in field_boundary_values(2):
             frame = data_hdr(8, 1, 0, 0, self._next_seq(), dur)
-            ok, cp = self._inj(frame, phase, f'duration-{dur:#06x}', encrypt=True)
+            ok, cp = self._inj(frame, phase, f'duration-bnd-{dur:#06x}', encrypt=True)
+            total += 1
+            if cp: crash_path = cp
+        for strategy, dur_bytes in all_byte_mutations(2):
+            dur_val = struct.unpack('<H', dur_bytes)[0]
+            frame = data_hdr(8, 1, 0, 0, self._next_seq(), dur_val)
+            ok, cp = self._inj(frame, phase, f'duration-{strategy.value}', encrypt=True)
             total += 1
             if cp: crash_path = cp
 
@@ -615,8 +646,8 @@ class FuzzCampaign:
         total = 0
 
         # Auth frame mutations
-        for algo in (0, 1, 2, 3, 4, 65535):
-            for seq in (0, 1, 8, 15, 22, 65535):
+        for algo in field_boundary_values(2):
+            for seq in field_boundary_values(2):
                 body = struct.pack('<HHH', algo, seq, 0)
                 frame = _mgmt(self.station, 11, body)
                 ok, cp = self._inj(frame, phase, f'auth-algo-0x{algo:04x}')
@@ -634,7 +665,7 @@ class FuzzCampaign:
                 if cp: crash_path = cp
 
         # Deauth with every reason code + trailing garbage
-        for code in frozenset({0, 1, 2, 3, 4, 65535}):
+        for code in field_boundary_values(2):
             frame = _mgmt(self.station, 12, struct.pack('<H', code))
             ok, cp = self._inj(frame, phase, f'deauth-reason-{code}')
             total += 1
@@ -648,14 +679,14 @@ class FuzzCampaign:
             if cp: crash_path = cp
 
         # Disassoc reason sweep
-        for code in frozenset({0, 1, 2, 3, 4, 65535}):
+        for code in field_boundary_values(2):
             frame = _mgmt(self.station, 10, struct.pack('<H', code))
             ok, cp = self._inj(frame, phase, f'disassoc-reason-{code}')
             total += 1
             if cp: crash_path = cp
 
         # Broadcast deauth (from our MAC to ff:ff:ff:ff:ff:ff)
-        for code in frozenset({0, 32768, 2, 3, 1, 4, 65535}):
+        for code in field_boundary_values(2):
             p = Dot11(type=0, subtype=12, FCfield=0,
                       addr1='ff:ff:ff:ff:ff:ff',
                       addr2=self.station.mac,
@@ -745,9 +776,18 @@ class FuzzCampaign:
                     total += 1
                     if cp: crash_path = cp
 
+        # ADDBA buf_size ByteStrategy sweep (all_byte_mutations covers ByteStrategy on 2-byte field)
+        for strategy, buf_bytes in all_byte_mutations(2):
+            buf_size = struct.unpack('<H', buf_bytes)[0] & 0x3FF  # 10-bit field
+            body = addba_req(buf_size)
+            frame = _action(self.station, 3, 0, body)
+            ok, cp = self._inj(frame, phase, f'addba-bufsz-{strategy.value}')
+            total += 1
+            if cp: crash_path = cp
+
         # DELBA for various TIDs
-        for tid in (0, 7, 8, 15):
-            for reason in (0, 1, 37, 65535):
+        for tid in field_boundary_values(1)[:8]:
+            for reason in field_boundary_values(2):
                 body  = delba(tid=tid, reason=reason)
                 frame = _action(self.station, 3, 2, body)  # Act=2 (DELBA)
                 ok, cp = self._inj(frame, phase, f'delba-tid{tid}-reason{reason}')
@@ -756,9 +796,9 @@ class FuzzCampaign:
                 if cp: crash_path = cp
 
         # Unknown BA action codes
-        for act in (3, 4, 10, 50, 127, 200, 255):
+        for act in field_boundary_values(1):
             frame = _action(self.station, 3, act, b'\x00' * 4)
-            ok, cp = self._inj(frame, phase, 'ba-unknown-act')
+            ok, cp = self._inj(frame, phase, f'ba-unknown-act-{act:#04x}')
             total += 1
             if cp: crash_path = cp
 
@@ -779,18 +819,18 @@ class FuzzCampaign:
         total = 0
 
         # Unsolicited SA Query Response (we send response without AP sending request)
-        for tid in frozenset({0, 1, 57005, 65535}):
+        for tid in field_boundary_values(2):
             body  = struct.pack('<H', tid)
             frame = _action(self.station, 8, 1, body)  # Cat=8 (SA Query), Act=1 (Resp)
-            ok, cp = self._inj(frame, phase, f'sa-resp-unsolicited-{tid:#x}')
+            ok, cp = self._inj(frame, phase, f'sa-resp-unsolicited-{tid:#06x}')
             total += 1
             if cp: crash_path = cp
 
         # SA Query Request trans_id sweep
-        for tid in frozenset({0, 1, 43690, 21845, 65535}):
+        for tid in field_boundary_values(2):
             body  = struct.pack('<H', tid)
             frame = _action(self.station, 8, 0, body)  # Act=0 (Request)
-            ok, cp = self._inj(frame, phase, f'sa-req-{tid:#x}')
+            ok, cp = self._inj(frame, phase, f'sa-req-{tid:#06x}')
             total += 1
             if cp: crash_path = cp
 
@@ -814,9 +854,9 @@ class FuzzCampaign:
                 if cp: crash_path = cp
 
         # Unknown SA action codes
-        for act in (2, 3, 10, 127, 200, 255):
+        for act in field_boundary_values(1):
             frame = _action(self.station, 8, act, b'\x00\x00')
-            ok, cp = self._inj(frame, phase, 'sa-unknown-act')
+            ok, cp = self._inj(frame, phase, f'sa-unknown-act-{act:#04x}')
             total += 1
             if cp: crash_path = cp
 
@@ -841,29 +881,29 @@ class FuzzCampaign:
             return ie
 
         # Measurement type sweep
-        for meas_type in (50, 100, 127, 200, 255):
+        for meas_type in field_boundary_values(1):
             for ch in (0,):
                 for dur in field_boundary_values(2)[:4]:
                     ie   = meas_req(1, meas_type, ch, dur)
                     frame = _action(self.station, 0, 0, ie)  # Cat=0, Act=0 (Measurement Req)
-                    ok, cp = self._inj(frame, phase, f'meas-type-{meas_type}')
+                    ok, cp = self._inj(frame, phase, f'meas-type-{meas_type:#04x}')
                     total += 1
                     if cp: crash_path = cp
 
         # Channel switch announcements
-        for new_ch in (0, 1, 6, 13, 14, 36, 100, 165, 255):
-            for count in (0, 1, 5, 255):
+        for new_ch in field_boundary_values(1):
+            for count in field_boundary_values(1):
                 csa_body  = bytes([1, new_ch, count])  # mode, new_ch, count
                 csa_ie    = ie_build(37, csa_body)  # CSA IE tag=37
                 frame = _action(self.station, 0, 4, csa_ie)  # Act=4 (Chan Switch)
-                ok, cp = self._inj(frame, phase, f'csa-ch{new_ch}-cnt{count}')
+                ok, cp = self._inj(frame, phase, f'csa-ch{new_ch:#04x}-cnt{count:#04x}')
                 total += 1
                 if cp: crash_path = cp
 
         # Unknown spectrum actions
-        for act in (5, 6, 7, 50, 127, 255):
+        for act in field_boundary_values(1):
             frame = _action(self.station, 0, act, b'\x00' * 4)
-            ok, cp = self._inj(frame, phase, 'spectrum-unknown-act')
+            ok, cp = self._inj(frame, phase, f'spectrum-unknown-act-{act:#04x}')
             total += 1
             if cp: crash_path = cp
 
@@ -894,12 +934,12 @@ class FuzzCampaign:
 
         # BSS Transition Request with varying neighbor counts
         bssid = self.station.bss or 'aa:bb:cc:dd:ee:ff'
-        for count, label in [(0,'0'), (1,'1'), (10,'10'), (50,'50'), (100,'100'), (200,'200')]:
-            nr_ie     = neighbor_ie(bssid) * min(count, 50)
-            body      = bss_trans_req(1, 1, 0, 10, nr_ie)
-            frame     = _action(self.station, 10, 7, body)  # Cat=10 (WNM), Act=7 (BSS Trans Req)
-            ok, cp    = self._inj(frame, phase, f'wnm-bss-trans-{label}-neighbors')
-            total    += 1
+        for count in field_boundary_values(1):
+            nr_ie  = neighbor_ie(bssid) * min(count, 50)  # cap at 50
+            body   = bss_trans_req(1, 1, 0, 10, nr_ie)
+            frame  = _action(self.station, 10, 7, body)  # Cat=10 (WNM), Act=7 (BSS Trans Req)
+            ok, cp = self._inj(frame, phase, f'wnm-bss-trans-{count}-neighbors')
+            total += 1
             if cp: crash_path = cp
 
         # WNM BSS Trans with malformed neighbor IE
@@ -916,24 +956,24 @@ class FuzzCampaign:
             if cp: crash_path = cp
 
         # WNM Sleep Request
-        for interval in frozenset({0, 1, 65535}):
+        for interval in field_boundary_values(2):
             body  = bytes([1]) + struct.pack('<H', interval)  # action_type=1, interval
             frame = _action(self.station, 10, 16, body)  # Act=16 (WNM Sleep)
-            ok, cp = self._inj(frame, phase, f'wnm-sleep-{interval}')
+            ok, cp = self._inj(frame, phase, f'wnm-sleep-{interval:#06x}')
             total += 1
             if cp: crash_path = cp
 
         # WNM BSS Transition Query (reason codes)
-        for reason in frozenset({0, 1, 5, 7, 8, 255}):
+        for reason in field_boundary_values(1):
             frame = _action(self.station, 10, 6, bytes([1, reason]))  # Act=6 (Trans Query)
-            ok, cp = self._inj(frame, phase, f'wnm-trans-query-reason-{reason}')
+            ok, cp = self._inj(frame, phase, f'wnm-trans-query-reason-{reason:#04x}')
             total += 1
             if cp: crash_path = cp
 
         # Unknown WNM action codes
-        for act in (20, 21, 22, 50, 100, 200, 255):
+        for act in field_boundary_values(1):
             frame = _action(self.station, 10, act, b'\x00' * 4)
-            ok, cp = self._inj(frame, phase, 'wnm-unknown-act')
+            ok, cp = self._inj(frame, phase, f'wnm-unknown-act-{act:#04x}')
             total += 1
             if cp: crash_path = cp
 
@@ -960,22 +1000,22 @@ class FuzzCampaign:
         oui_names = {OUI_BROADCOM: 'brcm', OUI_MICROSOFT: 'msft', OUI_QUALCOMM: 'qcom'}
 
         for oui, name in zip(ouis, [oui_names[o] for o in ouis]):
-            for subtype in (64, 127, 128, 200, 255):
-                for body_len in (0, 1, 10, 255):
+            for subtype in field_boundary_values(1):
+                for body_len in field_boundary_values(1):
                     body     = b'' if body_len == 0 else b'\x01' * min(body_len, 100)
                     payload  = oui + bytes([subtype]) + body
                     hdr      = bytes([127, 0]) + payload  # Cat=127, Act=0
                     frame    = _mgmt(self.station, 13, hdr)
-                    ok, cp   = self._inj(frame, phase, f'vendor-{name}-sub{subtype}-bodylen{body_len}')
+                    ok, cp   = self._inj(frame, phase, f'vendor-{name}-sub{subtype:#04x}-bodylen{body_len:#04x}')
                     total   += 1
                     if cp: crash_path = cp
 
         # Protected Vendor Specific (Cat=126)
-        for subtype in (0, 1, 4, 8, 16, 64, 200):
+        for subtype in field_boundary_values(1):
             payload = OUI_BROADCOM + bytes([subtype]) + b'\xde\xad\xbe\xef'
             hdr     = bytes([126, 0]) + payload
             frame   = _mgmt(self.station, 13, hdr, fc=0x40)  # Protected
-            ok, cp  = self._inj(frame, phase, 'vendor-protected-brcm-sub' + str(subtype))
+            ok, cp  = self._inj(frame, phase, f'vendor-protected-brcm-sub{subtype:#04x}')
             total  += 1
             if cp: crash_path = cp
 
